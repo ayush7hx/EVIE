@@ -5,6 +5,10 @@ const http = require("node:http");
 const path = require("node:path");
 const { randomBytes } = require("node:crypto");
 const {
+  ActionRowBuilder,
+  AttachmentBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   ChannelType,
   Client,
   GatewayIntentBits,
@@ -74,7 +78,7 @@ function explainCommands() {
     "`/template save`, `/template list`, `/template apply` — manage reusable templates.",
     "`/ping` — check bot latency.",
     "",
-    "Restore only adds missing roles and channels; it does not edit or delete existing items.",
+    "Restore options let you review role/channel loading, settings, and safe extra-item deletion before applying changes.",
   ].join("\n");
 }
 
@@ -112,6 +116,31 @@ function mapRoleOverwrites(channelData, existingRoles, restoredRoleIds) {
       };
     })
     .filter(Boolean);
+}
+
+function getRestoreChannelType(channelType) {
+  return channelType === ChannelType.GuildAnnouncement
+    ? ChannelType.GuildText
+    : channelType;
+}
+
+function hasMatchingChannel(existingChannels, channelData) {
+  return existingChannels.some((channel) =>
+    channelMatchesData(channel, channelData),
+  );
+}
+
+function channelMatchesData(channel, channelData) {
+  const sameType =
+    channel.type === channelData.type ||
+    channel.type === getRestoreChannelType(channelData.type);
+  if (channel.name !== channelData.name || !sameType) {
+    return false;
+  }
+  return (
+    channelData.type === ChannelType.GuildCategory ||
+    (channel.parent?.name ?? null) === (channelData.parentName ?? null)
+  );
 }
 
 function createSnapshot(guild) {
@@ -234,28 +263,112 @@ async function readBackup(guildId, backupId) {
   return snapshot;
 }
 
-async function restoreSnapshot(guild, snapshot) {
+async function buildRestorePlan(guild, snapshot, options) {
   await Promise.all([guild.roles.fetch(), guild.channels.fetch()]);
   const me = await guild.members.fetchMe();
-  const missingRoles = snapshot.roles.filter(
-    (roleData) =>
-      !guild.roles.cache.has(roleData.id) &&
-      !guild.roles.cache.some((role) => role.name === roleData.name),
+  const rolesToDelete = [];
+  const skippedRoleDeletes = [];
+  if (options.deleteRoles) {
+    for (const role of guild.roles.cache.values()) {
+      if (role.id === guild.id || role.managed) {
+        continue;
+      }
+      if (
+        snapshot.roles.some(
+          (roleData) => roleData.id === role.id || roleData.name === role.name,
+        )
+      ) {
+        continue;
+      }
+      (role.editable ? rolesToDelete : skippedRoleDeletes).push({
+        id: role.id,
+        name: role.name,
+      });
+    }
+  }
+
+  const rolesToCreate = [];
+  const rolesToUpdate = [];
+  const skippedRoleUpdates = [];
+  if (options.loadRoles) {
+    for (const roleData of snapshot.roles) {
+      const role =
+        guild.roles.cache.get(roleData.id) ||
+        guild.roles.cache.find((candidate) => candidate.name === roleData.name);
+      if (!role) {
+        rolesToCreate.push(roleData);
+      } else if (role.editable) {
+        rolesToUpdate.push({ id: role.id, roleData });
+      } else {
+        skippedRoleUpdates.push(role.name);
+      }
+    }
+  }
+
+  const backupableChannels = guild.channels.cache.filter((channel) =>
+    BACKUPABLE_CHANNEL_TYPES.has(channel.type),
   );
-  const missingChannels = snapshot.channels.filter((channelData) => {
-    const identity = `${channelData.type}:${channelData.name}`;
-    return !guild.channels.cache.some(
-      (channel) => `${channel.type}:${channel.name}` === identity,
+  const channelsInBackup = (channel) =>
+    snapshot.channels.some((channelData) =>
+      channelMatchesData(channel, channelData),
     );
-  });
+  const channelsToDelete = [];
+  const skippedChannelDeletes = [];
+  if (options.deleteChannels) {
+    for (const channel of backupableChannels.values()) {
+      if (channelsInBackup(channel)) {
+        continue;
+      }
+      (channel.deletable ? channelsToDelete : skippedChannelDeletes).push({
+        id: channel.id,
+        name: channel.name,
+        type: channel.type,
+      });
+    }
+  }
+  channelsToDelete.sort(
+    (a, b) =>
+      Number(a.type === ChannelType.GuildCategory) -
+      Number(b.type === ChannelType.GuildCategory),
+  );
+
+  const channelsToCreate = options.loadChannels
+    ? snapshot.channels
+        .filter((channelData) => !hasMatchingChannel(backupableChannels, channelData))
+        .sort(
+          (a, b) =>
+            Number(a.type !== ChannelType.GuildCategory) -
+            Number(b.type !== ChannelType.GuildCategory),
+        )
+    : [];
+  const channelsToUpdate = [];
+  const skippedChannelUpdates = [];
+  if (options.loadSettings) {
+    for (const channelData of snapshot.channels) {
+      const channel = backupableChannels.find((candidate) =>
+        channelMatchesData(candidate, channelData),
+      );
+      if (!channel) {
+        continue;
+      }
+      (channel.manageable ? channelsToUpdate : skippedChannelUpdates).push(
+        channel.manageable
+          ? { id: channel.id, channelData }
+          : channel.name,
+      );
+    }
+  }
+
   if (
-    missingRoles.length > 0 &&
+    (rolesToDelete.length || rolesToCreate.length || rolesToUpdate.length) &&
     !me.permissions.has(PermissionFlagsBits.ManageRoles)
   ) {
     throw new Error("EVIE needs Manage Roles permission in the target server.");
   }
   if (
-    missingChannels.length > 0 &&
+    (channelsToDelete.length ||
+      channelsToCreate.length ||
+      channelsToUpdate.length) &&
     !me.permissions.has(PermissionFlagsBits.ManageChannels)
   ) {
     throw new Error(
@@ -263,25 +376,91 @@ async function restoreSnapshot(guild, snapshot) {
     );
   }
 
+  return {
+    rolesToDelete,
+    skippedRoleDeletes,
+    rolesToCreate,
+    rolesToUpdate,
+    skippedRoleUpdates,
+    channelsToDelete,
+    skippedChannelDeletes,
+    channelsToCreate,
+    channelsToUpdate,
+    skippedChannelUpdates,
+  };
+}
+
+async function restoreSnapshot(guild, snapshot, options, plan) {
+  await Promise.all([guild.roles.fetch(), guild.channels.fetch()]);
+  const counts = {
+    rolesAdded: 0,
+    rolesUpdated: 0,
+    rolesDeleted: 0,
+    channelsAdded: 0,
+    channelsUpdated: 0,
+    channelsDeleted: 0,
+    permissionOverwrites: 0,
+    announcementChannelsConverted: 0,
+  };
+
+  for (const entry of plan.channelsToDelete) {
+    const channel = guild.channels.cache.get(entry.id);
+    if (channel?.deletable) {
+      await channel.delete("EVIE authorized backup restore");
+      counts.channelsDeleted += 1;
+    }
+  }
+  for (const entry of plan.rolesToDelete) {
+    const role = guild.roles.cache.get(entry.id);
+    if (role?.editable) {
+      await role.delete("EVIE authorized backup restore");
+      counts.rolesDeleted += 1;
+    }
+  }
+
+  for (const roleData of plan.rolesToCreate) {
+    if (guild.roles.cache.some((role) => role.name === roleData.name)) {
+      continue;
+    }
+    await guild.roles.create({
+      name: roleData.name,
+      color: roleData.color,
+      hoist: roleData.hoist,
+      mentionable: roleData.mentionable,
+      permissions: BigInt(roleData.permissions),
+      reason: "EVIE authorized structure restore",
+    });
+    counts.rolesAdded += 1;
+  }
+  for (const entry of plan.rolesToUpdate) {
+    const role =
+      guild.roles.cache.get(entry.id) ||
+      guild.roles.cache.find((candidate) => candidate.name === entry.roleData.name);
+    if (!role?.editable) {
+      continue;
+    }
+    await role.edit({
+      name: entry.roleData.name,
+      color: entry.roleData.color,
+      hoist: entry.roleData.hoist,
+      mentionable: entry.roleData.mentionable,
+      permissions: BigInt(entry.roleData.permissions),
+      reason: "EVIE authorized backup restore",
+    });
+    counts.rolesUpdated += 1;
+  }
+
   const existingRoles = new Map(
     guild.roles.cache.map((role) => [role.name, role]),
   );
   const restoredRoleIds = new Map();
+  restoredRoleIds.set(snapshot.guildId, guild.roles.everyone);
   for (const roleData of snapshot.roles) {
-    let role =
+    const role =
       guild.roles.cache.get(roleData.id) || existingRoles.get(roleData.name);
-    if (!role) {
-      role = await guild.roles.create({
-        name: roleData.name,
-        color: roleData.color,
-        hoist: roleData.hoist,
-        mentionable: roleData.mentionable,
-        permissions: BigInt(roleData.permissions),
-        reason: "EVIE authorized structure restore",
-      });
+    if (role) {
+      restoredRoleIds.set(roleData.id, role);
     }
-    existingRoles.set(role.name, role);
-    restoredRoleIds.set(roleData.id, role);
   }
 
   const categories = new Map(
@@ -289,78 +468,124 @@ async function restoreSnapshot(guild, snapshot) {
       .filter((channel) => channel.type === ChannelType.GuildCategory)
       .map((channel) => [channel.name, channel]),
   );
-  let permissionOverwritesApplied = 0;
-  for (const channelData of snapshot.channels) {
-    if (channelData.type !== ChannelType.GuildCategory) {
-      continue;
+  const createdChannelIds = new Set();
+  if (options.loadChannels) {
+    for (const channelData of plan.channelsToCreate) {
+      if (channelData.type === ChannelType.GuildCategory) {
+        const category = await guild.channels.create({
+          name: channelData.name,
+          type: ChannelType.GuildCategory,
+          reason: "EVIE authorized structure restore",
+        });
+        categories.set(category.name, category);
+        createdChannelIds.add(category.id);
+        counts.channelsAdded += 1;
+      }
     }
-    if (!categories.has(channelData.name)) {
-      const permissionOverwrites = mapRoleOverwrites(
+    for (const channelData of plan.channelsToCreate) {
+      if (channelData.type === ChannelType.GuildCategory) {
+        continue;
+      }
+      const channelOptions = {
+        name: channelData.name,
+        type: getRestoreChannelType(channelData.type),
+        reason: "EVIE authorized structure restore",
+      };
+      if (channelData.parentName && categories.has(channelData.parentName)) {
+        channelOptions.parent = categories.get(channelData.parentName).id;
+      }
+      const channel = await guild.channels.create(channelOptions);
+      createdChannelIds.add(channel.id);
+      counts.channelsAdded += 1;
+      if (channelData.type === ChannelType.GuildAnnouncement) {
+        counts.announcementChannelsConverted += 1;
+      }
+    }
+  }
+
+  if (options.loadSettings) {
+    const mappedRoleIds = new Set(
+      [guild.roles.everyone?.id, ...restoredRoleIds.values()]
+        .filter(Boolean)
+        .map((role) => role.id),
+    );
+    for (const channelData of snapshot.channels) {
+      const channel = guild.channels.cache.find((candidate) =>
+        channelMatchesData(candidate, channelData),
+      );
+      if (!channel) {
+        continue;
+      }
+      if (
+        !createdChannelIds.has(channel.id) &&
+        !plan.channelsToUpdate.some((entry) => entry.id === channel.id)
+      ) {
+        continue;
+      }
+
+      const editOptions = {};
+      if (channelData.type !== ChannelType.GuildCategory) {
+        if (channelData.parentName) {
+          const parent = categories.get(channelData.parentName);
+          if (parent) {
+            editOptions.parent = parent.id;
+          }
+        } else {
+          editOptions.parent = null;
+        }
+        if (
+          channelData.type === ChannelType.GuildText ||
+          channelData.type === ChannelType.GuildAnnouncement
+        ) {
+          editOptions.topic = channelData.topic ?? null;
+          editOptions.nsfw = channelData.nsfw;
+          editOptions.rateLimitPerUser = channelData.rateLimitPerUser;
+        } else if (channelData.type === ChannelType.GuildVoice) {
+          editOptions.bitrate = channelData.bitrate ?? undefined;
+          editOptions.userLimit = channelData.userLimit ?? undefined;
+        }
+      }
+      if (Object.keys(editOptions).length) {
+        editOptions.reason = "EVIE authorized backup restore";
+        await channel.edit(editOptions);
+      }
+      if (plan.channelsToUpdate.some((entry) => entry.id === channel.id)) {
+        counts.channelsUpdated += 1;
+      }
+
+      const desiredOverwrites = mapRoleOverwrites(
         channelData,
         existingRoles,
         restoredRoleIds,
       );
-      const category = await guild.channels.create({
-        name: channelData.name,
-        type: ChannelType.GuildCategory,
-        permissionOverwrites,
-        reason: "EVIE authorized structure restore",
-      });
-      permissionOverwritesApplied += permissionOverwrites.length;
-      categories.set(category.name, category);
+      const desiredRoleIds = new Set(
+        desiredOverwrites.map((overwrite) => overwrite.id),
+      );
+      for (const overwrite of channel.permissionOverwrites.cache.values()) {
+        if (
+          overwrite.type === 0 &&
+          mappedRoleIds.has(overwrite.id) &&
+          !desiredRoleIds.has(overwrite.id)
+        ) {
+          await channel.permissionOverwrites.delete(
+            overwrite.id,
+            "EVIE authorized backup restore",
+          );
+          counts.permissionOverwrites += 1;
+        }
+      }
+      for (const overwrite of desiredOverwrites) {
+        await channel.permissionOverwrites.edit(
+          overwrite.id,
+          { allow: overwrite.allow, deny: overwrite.deny },
+          "EVIE authorized backup restore",
+        );
+        counts.permissionOverwrites += 1;
+      }
     }
   }
 
-  const existingChannels = new Set(
-    guild.channels.cache.map((channel) => `${channel.type}:${channel.name}`),
-  );
-  let createdChannels = 0;
-  for (const channelData of snapshot.channels) {
-    if (channelData.type === ChannelType.GuildCategory) {
-      continue;
-    }
-
-    const identity = `${channelData.type}:${channelData.name}`;
-    if (existingChannels.has(identity)) {
-      continue;
-    }
-
-    const permissionOverwrites = mapRoleOverwrites(
-      channelData,
-      existingRoles,
-      restoredRoleIds,
-    );
-
-    const options = {
-      name: channelData.name,
-      type: channelData.type,
-      parent: channelData.parentName
-        ? categories.get(channelData.parentName)?.id
-        : undefined,
-      permissionOverwrites,
-      reason: "EVIE authorized structure restore",
-    };
-    if (channelData.type === ChannelType.GuildText ||
-        channelData.type === ChannelType.GuildAnnouncement) {
-      options.topic = channelData.topic ?? undefined;
-      options.nsfw = channelData.nsfw;
-      options.rateLimitPerUser = channelData.rateLimitPerUser;
-    } else if (channelData.type === ChannelType.GuildVoice) {
-      options.bitrate = channelData.bitrate ?? undefined;
-      options.userLimit = channelData.userLimit ?? undefined;
-    }
-
-    await guild.channels.create(options);
-    permissionOverwritesApplied += permissionOverwrites.length;
-    existingChannels.add(identity);
-    createdChannels += 1;
-  }
-
-  return {
-    roles: missingRoles.length,
-    channels: createdChannels,
-    permissionOverwrites: permissionOverwritesApplied,
-  };
+  return { ...counts, plan };
 }
 
 async function saveTemplate(name, guild) {
@@ -416,38 +641,137 @@ async function readTemplate(name) {
   return snapshot;
 }
 
+function createRestoreOptions() {
+  return {
+    deleteRoles: false,
+    deleteChannels: false,
+    loadRoles: true,
+    loadChannels: true,
+    loadSettings: true,
+  };
+}
+
+function restoreOptionRows(code, options) {
+  const choices = [
+    ["deleteRoles", "Delete roles"],
+    ["deleteChannels", "Delete channels"],
+    ["loadRoles", "Load roles"],
+    ["loadChannels", "Load channels"],
+    ["loadSettings", "Load settings"],
+  ];
+  const choiceRow = new ActionRowBuilder().addComponents(
+    ...choices.map(([key, label]) =>
+      new ButtonBuilder()
+        .setCustomId(`evie:${code}:${key}`)
+        .setLabel(label)
+        .setStyle(options[key] ? ButtonStyle.Success : ButtonStyle.Secondary),
+    ),
+  );
+  const actionRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`evie:${code}:continue`)
+      .setLabel("Continue")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`evie:${code}:cancel`)
+      .setLabel("Cancel")
+      .setStyle(ButtonStyle.Secondary),
+  );
+  return [choiceRow, actionRow];
+}
+
+function restoreConfirmationRows(code) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`evie:${code}:apply`)
+        .setLabel("Confirm restore")
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId(`evie:${code}:cancel`)
+        .setLabel("Cancel")
+        .setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
+function formatRestorePlan(guild, description, plan, confirmCommand) {
+  const lines = [
+    `EVIE restore preview · ${description}`,
+    `Target: ${guild.name} (${guild.id})`,
+    "",
+    "Planned changes:",
+  ];
+  for (const role of plan.rolesToDelete) {
+    lines.push(`- Delete extra role: ${role.name} (removes its member assignments)`);
+  }
+  for (const roleData of plan.rolesToCreate) {
+    lines.push(`+ Create role: ${roleData.name}`);
+  }
+  for (const entry of plan.rolesToUpdate) {
+    lines.push(`~ Update role settings: ${entry.roleData.name}`);
+  }
+  for (const channel of plan.channelsToDelete) {
+    const label =
+      channel.type === ChannelType.GuildCategory ? "category" : "channel";
+    lines.push(`- Delete extra ${label}: ${channel.name}`);
+  }
+  for (const channelData of plan.channelsToCreate) {
+    const label =
+      channelData.type === ChannelType.GuildCategory ? "category" : "channel";
+    lines.push(`+ Create ${label}: ${channelData.name}`);
+  }
+  for (const entry of plan.channelsToUpdate) {
+    lines.push(`~ Apply backup settings to existing channel: ${entry.channelData.name}`);
+  }
+  for (const name of plan.skippedRoleDeletes) {
+    lines.push(`! Cannot delete protected role: ${name}`);
+  }
+  for (const name of plan.skippedRoleUpdates) {
+    lines.push(`! Cannot update protected role: ${name}`);
+  }
+  for (const channel of plan.skippedChannelDeletes) {
+    lines.push(`! Cannot delete protected channel/category: ${channel.name}`);
+  }
+  for (const name of plan.skippedChannelUpdates) {
+    lines.push(`! Cannot update protected channel: ${name}`);
+  }
+  if (
+    !plan.rolesToDelete.length &&
+    !plan.rolesToCreate.length &&
+    !plan.rolesToUpdate.length &&
+    !plan.channelsToDelete.length &&
+    !plan.channelsToCreate.length &&
+    !plan.channelsToUpdate.length
+  ) {
+    lines.push("No changes are needed for the selected options.");
+  }
+  lines.push(
+    "",
+    "Only extra roles/channels absent from the backup are deleted. " +
+      "Managed roles and member-specific channel permissions are preserved.",
+    `Confirm with the button below, or use ${confirmCommand}.`,
+  );
+
+  const report = lines.join("\n");
+  if (report.length <= 1_800) {
+    return { content: report };
+  }
+  const summary =
+    `**EVIE restore preview · ${description}**\n` +
+    `Target: **${guild.name}** (\`${guild.id}\`). The complete change list is attached.\n` +
+    `Confirm with the button, or use ${confirmCommand}.`;
+  return {
+    content: summary,
+    files: [
+      new AttachmentBuilder(Buffer.from(report, "utf8"), {
+        name: "evie-restore-preview.txt",
+      }),
+    ],
+  };
+}
+
 async function previewRestore(reply, guild, snapshot, description, confirmCommand) {
-  await Promise.all([guild.roles.fetch(), guild.channels.fetch()]);
-  const existingRoles = guild.roles.cache;
-  const existingChannels = guild.channels.cache;
-  const rolesToAdd = snapshot.roles.filter(
-    (roleData) =>
-      !existingRoles.has(roleData.id) &&
-      !existingRoles.some((role) => role.name === roleData.name),
-  ).length;
-  const channelsToAdd = snapshot.channels.filter(
-    (channelData) =>
-      !existingChannels.some(
-        (channel) =>
-          channel.type === channelData.type &&
-          channel.name === channelData.name,
-      ),
-  ).length;
-  const missingChannelData = snapshot.channels.filter(
-    (channelData) =>
-      !existingChannels.some(
-        (channel) =>
-          channel.type === channelData.type &&
-          channel.name === channelData.name,
-      ),
-  );
-  const permissionOverwritesToApply = missingChannelData.reduce(
-    (count, channelData) =>
-      count + (Array.isArray(channelData.roleOverwrites)
-        ? channelData.roleOverwrites.length
-        : 0),
-    0,
-  );
   let code;
   do {
     code = randomBytes(3).toString("hex");
@@ -455,19 +779,184 @@ async function previewRestore(reply, guild, snapshot, description, confirmComman
 
   const timeout = setTimeout(() => pendingRestores.delete(code), 60_000);
   timeout.unref();
+  const options = createRestoreOptions();
   pendingRestores.set(code, {
     targetGuildId: guild.id,
     snapshot,
+    options,
     timeout,
   });
-  await reply(
-    `**EVIE preview · ${description}**\n` +
-      `Target: **${guild.name}** (\`${guild.id}\`)\n` +
-      `Will add: ${rolesToAdd} missing roles, ${channelsToAdd} missing supported channels.\n` +
-      `Will apply ${permissionOverwritesToApply} saved role permission overwrites to those new channels/categories.\n` +
-      "Existing items will not be changed; extra target items will not be removed.\n" +
-      `To apply this preview within 60 seconds, use ${confirmCommand(code)}.`,
+  const message = await reply(
+    `**What should EVIE load from this backup?**\n` +
+      `Target: **${guild.name}**\n` +
+      "Delete options remove only target items that are not in the backup. " +
+      "Load settings also updates matching existing channels.",
+    { components: restoreOptionRows(code, options) },
   );
+  const collector = message.createMessageComponentCollector({ time: 60_000 });
+  collector.on("collect", async (component) => {
+    if (component.user.id !== OWNER_ID) {
+      await component.reply({
+        content: "Only the configured bot owner can use these restore options.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const action = component.customId.slice(`evie:${code}:`.length);
+    const operation = pendingRestores.get(code);
+    if (operation?.busy) {
+      await component.deferUpdate();
+      return;
+    }
+    if (operation) {
+      operation.busy = true;
+    }
+    try {
+      await component.deferUpdate();
+      if (!operation) {
+        await message.edit({
+          content: "This restore preview expired. Run the restore command again.",
+          components: [],
+        });
+        collector.stop("expired");
+        return;
+      }
+
+      if (action === "cancel") {
+        clearTimeout(operation.timeout);
+        pendingRestores.delete(code);
+        await message.edit({ content: "Restore cancelled.", components: [] });
+        collector.stop("cancelled");
+        return;
+      }
+      if (action === "continue") {
+        collector.resetTimer({ time: 60_000 });
+        clearTimeout(operation.timeout);
+        operation.timeout = setTimeout(() => pendingRestores.delete(code), 60_000);
+        operation.timeout.unref();
+        const targetGuild = await getGuild(operation.targetGuildId);
+        operation.plan = await buildRestorePlan(
+          targetGuild,
+          operation.snapshot,
+          operation.options,
+        );
+        const report = formatRestorePlan(
+          targetGuild,
+          description,
+          operation.plan,
+          confirmCommand(code),
+        );
+        clearTimeout(operation.timeout);
+        operation.timeout = setTimeout(() => pendingRestores.delete(code), 60_000);
+        operation.timeout.unref();
+        await message.edit({
+          ...report,
+          components: restoreConfirmationRows(code),
+        });
+        return;
+      }
+      if (action === "apply") {
+        collector.resetTimer({ time: 60_000 });
+        const result = await applyPendingRestore(code);
+        await message.edit({
+          content:
+            `**Restore complete.** Added ${result.rolesAdded} roles and ${result.channelsAdded} channels; ` +
+            `updated ${result.rolesUpdated} roles and ${result.channelsUpdated} channels; ` +
+            `deleted ${result.rolesDeleted} roles and ${result.channelsDeleted} channels; ` +
+            `applied ${result.permissionOverwrites} role permission changes.` +
+            (result.announcementChannelsConverted
+              ? ` ${result.announcementChannelsConverted} announcement channels were created as regular text channels.`
+              : ""),
+          components: [],
+        });
+        collector.stop("applied");
+        return;
+      }
+      if (Object.hasOwn(operation.options, action)) {
+        operation.options[action] = !operation.options[action];
+        collector.resetTimer({ time: 60_000 });
+        clearTimeout(operation.timeout);
+        operation.timeout = setTimeout(() => pendingRestores.delete(code), 60_000);
+        operation.timeout.unref();
+        await message.edit({
+          content:
+            `**What should EVIE load from this backup?**\n` +
+            `Target: **${guild.name}**\n` +
+            "Delete options remove only target items that are not in the backup. " +
+            "Load settings also updates matching existing channels.",
+          components: restoreOptionRows(code, operation.options),
+        });
+      }
+    } catch (error) {
+      console.error(`EVIE restore preview ${action} failed:`, error);
+      const currentOperation = pendingRestores.get(code);
+      if (currentOperation && action === "apply") {
+        collector.resetTimer({ time: 60_000 });
+        await message.edit({
+          content: `Restore failed: ${error.message}\nYou can retry or cancel this preview.`,
+          components: restoreConfirmationRows(code),
+        });
+      } else {
+        clearTimeout(operation?.timeout);
+        pendingRestores.delete(code);
+        await message.edit({
+          content: `Could not prepare restore preview: ${error.message}`,
+          components: [],
+        });
+        collector.stop("failed");
+      }
+    } finally {
+      const currentOperation = pendingRestores.get(code);
+      if (currentOperation) {
+        currentOperation.busy = false;
+      }
+    }
+  });
+  collector.on("end", async (_collected, reason) => {
+    if (reason === "time") {
+      const operation = pendingRestores.get(code);
+      clearTimeout(operation?.timeout);
+      pendingRestores.delete(code);
+      await message.edit({
+        content: "This restore preview expired. Run the restore command again.",
+        components: [],
+      }).catch((error) =>
+        console.error("EVIE could not close an expired restore preview:", error),
+      );
+    }
+  });
+}
+
+async function applyPendingRestore(code) {
+  const operation = pendingRestores.get(code);
+  if (!operation || operation.applying) {
+    throw new Error(
+      "That preview expired, is already being applied, or the code is invalid.",
+    );
+  }
+
+  operation.applying = true;
+  clearTimeout(operation.timeout);
+  try {
+    const targetGuild = await getGuild(operation.targetGuildId);
+    if (!operation.plan) {
+      throw new Error("Continue through the restore preview before confirming.");
+    }
+    const result = await restoreSnapshot(
+      targetGuild,
+      operation.snapshot,
+      operation.options,
+      operation.plan,
+    );
+    pendingRestores.delete(code);
+    return result;
+  } catch (error) {
+    operation.applying = false;
+    operation.timeout = setTimeout(() => pendingRestores.delete(code), 60_000);
+    operation.timeout.unref();
+    throw error;
+  }
 }
 
 const slashCommands = [
@@ -579,7 +1068,8 @@ async function handleSlashCommand(interaction) {
   }
 
   await interaction.deferReply({ ephemeral: true });
-  const reply = (content) => interaction.editReply({ content });
+  const reply = (content, options = {}) =>
+    interaction.editReply({ content, ...options });
 
   try {
     if (interaction.commandName === "backup") {
@@ -647,16 +1137,15 @@ async function handleSlashCommand(interaction) {
       );
     } else if (interaction.commandName === "confirm") {
       const code = interaction.options.getString("code").toLowerCase();
-      const operation = pendingRestores.get(code);
-      if (!operation) {
-        throw new Error("That preview expired or the code is invalid.");
-      }
-      clearTimeout(operation.timeout);
-      pendingRestores.delete(code);
-      const targetGuild = await getGuild(operation.targetGuildId);
-      const result = await restoreSnapshot(targetGuild, operation.snapshot);
+      const result = await applyPendingRestore(code);
       await reply(
-        `Apply complete · ${result.roles} roles and ${result.channels} channels added; ${result.permissionOverwrites} role permission overwrites applied. Existing items were not changed or removed.`,
+        `Restore complete · Added ${result.rolesAdded} roles and ${result.channelsAdded} channels; ` +
+          `updated ${result.rolesUpdated} roles and ${result.channelsUpdated} channels; ` +
+          `deleted ${result.rolesDeleted} roles and ${result.channelsDeleted} channels; ` +
+          `applied ${result.permissionOverwrites} role permission changes.` +
+          (result.announcementChannelsConverted
+            ? ` ${result.announcementChannelsConverted} announcement channels were created as regular text channels.`
+            : ""),
       );
     } else if (interaction.commandName === "template") {
       const action = interaction.options.getSubcommand();
@@ -777,7 +1266,7 @@ client.on("messageCreate", async (message) => {
         getGuild(targetGuildId),
       ]);
       await previewRestore(
-        (content) => message.reply(content),
+        (content, options = {}) => message.reply({ content, ...options }),
         targetGuild,
         snapshot,
         "backup restore",
@@ -795,7 +1284,7 @@ client.on("messageCreate", async (message) => {
       ]);
       const { snapshot } = await saveBackup(sourceGuild);
       await previewRestore(
-        (content) => message.reply(content),
+        (content, options = {}) => message.reply({ content, ...options }),
         targetGuild,
         snapshot,
         "server sync",
@@ -835,7 +1324,7 @@ client.on("messageCreate", async (message) => {
           getGuild(targetId),
         ]);
         await previewRestore(
-          (content) => message.reply(content),
+          (content, options = {}) => message.reply({ content, ...options }),
           targetGuild,
           snapshot,
           `template \`${name}\``,
@@ -848,17 +1337,15 @@ client.on("messageCreate", async (message) => {
       }
     } else if (normalizedCommand === "confirm") {
       const code = args[0]?.toLowerCase();
-      const operation = pendingRestores.get(code);
-      if (!operation) {
-        await message.reply("That preview expired or the code is invalid.");
-        return;
-      }
-      clearTimeout(operation.timeout);
-      pendingRestores.delete(code);
-      const targetGuild = await getGuild(operation.targetGuildId);
-      const result = await restoreSnapshot(targetGuild, operation.snapshot);
+      const result = await applyPendingRestore(code);
       await message.reply(
-        `Apply complete · ${result.roles} roles and ${result.channels} channels added; ${result.permissionOverwrites} role permission overwrites applied. Existing items were not changed or removed.`,
+        `Restore complete · Added ${result.rolesAdded} roles and ${result.channelsAdded} channels; ` +
+          `updated ${result.rolesUpdated} roles and ${result.channelsUpdated} channels; ` +
+          `deleted ${result.rolesDeleted} roles and ${result.channelsDeleted} channels; ` +
+          `applied ${result.permissionOverwrites} role permission changes.` +
+          (result.announcementChannelsConverted
+            ? ` ${result.announcementChannelsConverted} announcement channels were created as regular text channels.`
+            : ""),
       );
     }
   } catch (error) {

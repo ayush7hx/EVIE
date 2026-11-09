@@ -1,6 +1,6 @@
 # EVIE
 
-EVIE is an original, prefix-only Discord bot for local backups and additive
+EVIE is an original Discord bot for local backups and configurable
 server-structure restore. It is not a copy of Xenon.
 
 ## Current features
@@ -10,18 +10,21 @@ server-structure restore. It is not a copy of Xenon.
   installed.
 - Backups contain non-managed roles and supported categories, text,
   announcement, and voice channels, including basic settings and role-based
-  channel permission overwrites. Saved role-specific allow/deny permissions
-  are recreated on new categories and channels during restore/sync.
-- Restore and sync first show a preview and require `=confirm <code>` within
-  60 seconds.
-- Apply is additive only: missing roles and channels are created; existing
-  roles/channels are not edited, and extra target items are not deleted.
-  Consequently, permission overwrites are applied to newly created items;
-  matching existing target channels are left untouched.
+  channel permission overwrites. Announcement channels are restored as regular
+  text channels for compatibility. Saved role-specific allow/deny permissions
+  can be applied to new and matching existing channels during restore/sync.
+- Restore and sync let you choose whether to delete extra target roles/channels
+  and whether to load roles, channels, and settings. EVIE then lists every
+  planned change and waits for confirmation.
+- Deletion is limited to target roles/channels/categories that are absent from
+  the backup; managed roles are protected. Deleting a role also removes its
+  assignments from members. Loading roles updates matching role settings;
+  loading settings updates matching channels and their saved role permissions
+  while preserving member-specific permission overwrites.
 - Backups and templates are stored locally under `data/`.
 
 Messages, members, member-specific permission overwrites, emoji/sticker
-assets, and server settings are not included in this implementation. It does
+assets, and guild-wide settings are not included in this implementation. It does
 not reproduce Xenon's branding, code, premium implementation, or complete
 feature set.
 
@@ -68,8 +71,9 @@ remain available as a fallback.
 2. In the **target server**, run `/restore`, set `source_server_id` to the
    source server's ID, and optionally set `backup_id`. Leave `backup_id` empty
    to use the newest backup from that source.
-3. Check EVIE's preview. If it looks right, run `/confirm` with the code shown
-   in the preview within 60 seconds.
+3. Choose the restore options, review EVIE's full change list, then press
+   **Confirm restore**. You can also use `/confirm` with the code shown in the
+   preview within 60 seconds.
 
 You can get a server ID by enabling Discord Developer Mode, then right-clicking
 the server and choosing **Copy Server ID**. The bot must be in both servers.
