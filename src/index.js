@@ -10,6 +10,7 @@ const {
   GatewayIntentBits,
   Partials,
   PermissionFlagsBits,
+  SlashCommandBuilder,
 } = require("discord.js");
 
 const PREFIX = "=";
@@ -64,22 +65,16 @@ async function getGuild(guildId) {
 
 function explainCommands() {
   return [
-    "╭───────────────〔 EVIE 〕───────────────╮",
-    "│  Authorized server structure tools    │",
-    "├───────────────────────────────────────┤",
-    "│  =help                 Show this menu │",
-    "│  =ping                 Check latency  │",
-    "│  =backup [server-id]   Save structure │",
-    "│  =backups [server-id]  List backups   │",
-    "│  =restore <src> <id> <target>         │",
-    "│  =sync <source> <target>              │",
-    "│  =template save <name> [server-id]    │",
-    "│  =template list                       │",
-    "│  =template apply <name> <target-id>   │",
-    "│  =confirm <code>      Apply preview   │",
-    "├───────────────────────────────────────┤",
-    "│  Add missing only; preview required.  │",
-    "╰───────────────────────────────────────╯",
+    "**EVIE commands**",
+    "`/backup` — back up this server.",
+    "`/backups` — list backups for this server, or another server ID.",
+    "`/restore` — restore a backup into this server. Leave backup ID blank for the latest backup.",
+    "`/confirm` — confirm the preview code EVIE gives you.",
+    "`/sync` — back up another server and preview adding its structure here.",
+    "`/template save`, `/template list`, `/template apply` — manage reusable templates.",
+    "`/ping` — check bot latency.",
+    "",
+    "Restore only adds missing roles and channels; it does not edit or delete existing items.",
   ].join("\n");
 }
 
@@ -421,7 +416,7 @@ async function readTemplate(name) {
   return snapshot;
 }
 
-async function previewRestore(message, guild, snapshot, description) {
+async function previewRestore(reply, guild, snapshot, description, confirmCommand) {
   await Promise.all([guild.roles.fetch(), guild.channels.fetch()]);
   const existingRoles = guild.roles.cache;
   const existingChannels = guild.channels.cache;
@@ -465,15 +460,250 @@ async function previewRestore(message, guild, snapshot, description) {
     snapshot,
     timeout,
   });
-  await message.reply(
+  await reply(
     `**EVIE preview · ${description}**\n` +
       `Target: **${guild.name}** (\`${guild.id}\`)\n` +
       `Will add: ${rolesToAdd} missing roles, ${channelsToAdd} missing supported channels.\n` +
       `Will apply ${permissionOverwritesToApply} saved role permission overwrites to those new channels/categories.\n` +
       "Existing items will not be changed; extra target items will not be removed.\n" +
-      `To apply this preview within 60 seconds, run \`=confirm ${code}\`.`,
+      `To apply this preview within 60 seconds, use ${confirmCommand(code)}.`,
   );
 }
+
+const slashCommands = [
+  new SlashCommandBuilder()
+    .setName("help")
+    .setDescription("Show EVIE commands"),
+  new SlashCommandBuilder()
+    .setName("ping")
+    .setDescription("Check EVIE latency"),
+  new SlashCommandBuilder()
+    .setName("backup")
+    .setDescription("Back up this server"),
+  new SlashCommandBuilder()
+    .setName("backups")
+    .setDescription("List saved backups")
+    .addStringOption((option) =>
+      option
+        .setName("server_id")
+        .setDescription("Server ID (defaults to this server)"),
+    ),
+  new SlashCommandBuilder()
+    .setName("restore")
+    .setDescription("Restore a backup into this server")
+    .addStringOption((option) =>
+      option
+        .setName("source_server_id")
+        .setDescription("Server ID where the backup was made (defaults to this server)"),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("backup_id")
+        .setDescription("Backup ID (defaults to the latest backup)"),
+    ),
+  new SlashCommandBuilder()
+    .setName("sync")
+    .setDescription("Preview adding another server's structure here")
+    .addStringOption((option) =>
+      option
+        .setName("source_server_id")
+        .setDescription("Server ID to copy from")
+        .setRequired(true),
+    ),
+  new SlashCommandBuilder()
+    .setName("confirm")
+    .setDescription("Apply the restore preview")
+    .addStringOption((option) =>
+      option
+        .setName("code")
+        .setDescription("The short code shown in the preview")
+        .setRequired(true),
+    ),
+  new SlashCommandBuilder()
+    .setName("template")
+    .setDescription("Save or apply reusable server templates")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("save")
+        .setDescription("Save this server as a template")
+        .addStringOption((option) =>
+          option
+            .setName("name")
+            .setDescription("Template name")
+            .setRequired(true),
+        ),
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("list")
+        .setDescription("List saved templates"),
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("apply")
+        .setDescription("Preview applying a template to this server")
+        .addStringOption((option) =>
+          option
+            .setName("name")
+            .setDescription("Template name")
+            .setRequired(true),
+        ),
+    ),
+].map((command) => command.toJSON());
+
+function requireInteractionGuild(interaction) {
+  if (!interaction.guildId) {
+    throw new Error("Use this command inside a server.");
+  }
+}
+
+async function handleSlashCommand(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    await interaction.reply({
+      content: "Only the configured bot owner can use EVIE commands.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (interaction.commandName === "help") {
+    await interaction.reply({ content: explainCommands(), ephemeral: true });
+    return;
+  }
+  if (interaction.commandName === "ping") {
+    await interaction.reply({
+      content: `Pong · ${client.ws.ping} ms`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  const reply = (content) => interaction.editReply({ content });
+
+  try {
+    if (interaction.commandName === "backup") {
+      requireInteractionGuild(interaction);
+      const guild = await getGuild(interaction.guildId);
+      const { backupId, snapshot } = await saveBackup(guild);
+      await reply(
+        `Backup saved for **${guild.name}** · ID: \`${backupId}\` · ${snapshot.roles.length} roles · ${snapshot.channels.length} supported channels.`,
+      );
+    } else if (interaction.commandName === "backups") {
+      const guildId =
+        interaction.options.getString("server_id") || interaction.guildId;
+      if (!guildId) {
+        throw new Error("Use this command in a server or provide a server ID.");
+      }
+      const backups = await listBackups(guildId);
+      await reply(
+        backups.length
+          ? `**Backups for server \`${guildId}\`**\n${backups
+              .slice(0, 10)
+              .map((backup) => `· \`${backup.backupId}\` — ${backup.createdAt}`)
+              .join("\n")}`
+          : "No backups found for that server.",
+      );
+    } else if (interaction.commandName === "restore") {
+      requireInteractionGuild(interaction);
+      const sourceGuildId =
+        interaction.options.getString("source_server_id") ||
+        interaction.guildId;
+      const requestedBackupId = interaction.options.getString("backup_id");
+      const backups = requestedBackupId
+        ? null
+        : await listBackups(sourceGuildId);
+      const backupId = requestedBackupId || backups[0]?.backupId;
+      if (!backupId) {
+        throw new Error(
+          "No backups found. Run /backup in the source server first.",
+        );
+      }
+      const [snapshot, targetGuild] = await Promise.all([
+        readBackup(sourceGuildId, backupId),
+        getGuild(interaction.guildId),
+      ]);
+      await previewRestore(
+        reply,
+        targetGuild,
+        snapshot,
+        "backup restore",
+        (code) => `\`/confirm code:${code}\``,
+      );
+    } else if (interaction.commandName === "sync") {
+      requireInteractionGuild(interaction);
+      const sourceId = interaction.options.getString("source_server_id");
+      const [sourceGuild, targetGuild] = await Promise.all([
+        getGuild(sourceId),
+        getGuild(interaction.guildId),
+      ]);
+      const { snapshot } = await saveBackup(sourceGuild);
+      await previewRestore(
+        reply,
+        targetGuild,
+        snapshot,
+        "server sync",
+        (code) => `\`/confirm code:${code}\``,
+      );
+    } else if (interaction.commandName === "confirm") {
+      const code = interaction.options.getString("code").toLowerCase();
+      const operation = pendingRestores.get(code);
+      if (!operation) {
+        throw new Error("That preview expired or the code is invalid.");
+      }
+      clearTimeout(operation.timeout);
+      pendingRestores.delete(code);
+      const targetGuild = await getGuild(operation.targetGuildId);
+      const result = await restoreSnapshot(targetGuild, operation.snapshot);
+      await reply(
+        `Apply complete · ${result.roles} roles and ${result.channels} channels added; ${result.permissionOverwrites} role permission overwrites applied. Existing items were not changed or removed.`,
+      );
+    } else if (interaction.commandName === "template") {
+      const action = interaction.options.getSubcommand();
+      if (action === "list") {
+        const templates = await listTemplates();
+        await reply(
+          templates.length
+            ? `**EVIE templates**\n${templates.map((name) => `· \`${name}\``).join("\n")}`
+            : "No templates saved yet.",
+        );
+      } else if (action === "save") {
+        requireInteractionGuild(interaction);
+        const name = interaction.options.getString("name");
+        const snapshot = await saveTemplate(
+          name,
+          await getGuild(interaction.guildId),
+        );
+        await reply(
+          `Template \`${name}\` saved · ${snapshot.roles.length} roles · ${snapshot.channels.length} supported channels.`,
+        );
+      } else if (action === "apply") {
+        requireInteractionGuild(interaction);
+        const name = interaction.options.getString("name");
+        const [snapshot, targetGuild] = await Promise.all([
+          readTemplate(name),
+          getGuild(interaction.guildId),
+        ]);
+        await previewRestore(
+          reply,
+          targetGuild,
+          snapshot,
+          `template \`${name}\``,
+          (code) => `\`/confirm code:${code}\``,
+        );
+      }
+    }
+  } catch (error) {
+    console.error(`EVIE /${interaction.commandName} failed:`, error);
+    await reply(`Command failed: ${error.message}`);
+  }
+}
+
+client.on("interactionCreate", async (interaction) => {
+  if (interaction.isChatInputCommand()) {
+    await handleSlashCommand(interaction);
+  }
+});
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.content.startsWith(PREFIX)) {
@@ -546,7 +776,13 @@ client.on("messageCreate", async (message) => {
         readBackup(sourceGuildId, backupId),
         getGuild(targetGuildId),
       ]);
-      await previewRestore(message, targetGuild, snapshot, "backup restore");
+      await previewRestore(
+        (content) => message.reply(content),
+        targetGuild,
+        snapshot,
+        "backup restore",
+        (code) => `\`=confirm ${code}\``,
+      );
     } else if (normalizedCommand === "sync") {
       const [sourceId, targetId] = args;
       if (!sourceId || !targetId) {
@@ -558,7 +794,13 @@ client.on("messageCreate", async (message) => {
         getGuild(targetId),
       ]);
       const { snapshot } = await saveBackup(sourceGuild);
-      await previewRestore(message, targetGuild, snapshot, "server sync");
+      await previewRestore(
+        (content) => message.reply(content),
+        targetGuild,
+        snapshot,
+        "server sync",
+        (code) => `\`=confirm ${code}\``,
+      );
     } else if (normalizedCommand === "template") {
       const [action, ...templateArgs] = args;
       if (action === "save") {
@@ -592,7 +834,13 @@ client.on("messageCreate", async (message) => {
           readTemplate(name),
           getGuild(targetId),
         ]);
-        await previewRestore(message, targetGuild, snapshot, `template \`${name}\``);
+        await previewRestore(
+          (content) => message.reply(content),
+          targetGuild,
+          snapshot,
+          `template \`${name}\``,
+          (code) => `\`=confirm ${code}\``,
+        );
       } else {
         await message.reply(
           "Usage: `=template save <name> [server-id]`, `=template list`, or `=template apply <name> <target-server-id>`",
@@ -619,8 +867,14 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-client.once("ready", () => {
+client.once("ready", async () => {
   console.log(`EVIE is online as ${client.user.tag}. Prefix: ${PREFIX}`);
+  try {
+    await client.application.commands.set(slashCommands);
+    console.log("EVIE slash commands registered.");
+  } catch (error) {
+    console.error("EVIE slash command registration failed:", error);
+  }
 });
 
 const port = Number(process.env.PORT || 3000);

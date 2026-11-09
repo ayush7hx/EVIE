@@ -43,27 +43,38 @@ feature set.
 
 Use Node.js 20 or newer. Do not share or commit your bot token.
 
-## Prefix commands
+## Commands
 
-EVIE registers no slash commands. The bot owner can issue commands in a server
-or DM; a server ID is required when the command is used in a DM.
+EVIE provides Discord slash commands. They are registered when the bot starts;
+the configured bot owner is the only person who can use them. Prefix commands
+remain available as a fallback.
 
 | Command | Description |
 | --- | --- |
-| `=help` | Show the command menu |
-| `=ping` | Check bot latency |
-| `=backup [server-id]` | Save a local structure backup |
-| `=backups [server-id]` | List backups for a server |
-| `=restore <source-id> <backup-id> <target-id>` | Preview an additive restore |
-| `=sync <source-id> <target-id>` | Back up and preview an additive sync |
-| `=template save <name> [server-id]` | Save a reusable local template |
-| `=template list` | List templates |
-| `=template apply <name> <target-id>` | Preview applying a template |
-| `=confirm <code>` | Apply the displayed restore/sync preview |
+| `/help` | Show the command menu |
+| `/ping` | Check bot latency |
+| `/backup` | Back up the server where the command is used |
+| `/backups [server_id]` | List backups for this server or a specified server |
+| `/restore [source_server_id] [backup_id]` | Preview restoring into this server; defaults to the latest backup |
+| `/sync <source_server_id>` | Back up a source server and preview adding its structure here |
+| `/confirm <code>` | Apply the displayed restore/sync preview |
+| `/template save <name>` | Save this server as a reusable template |
+| `/template list` | List templates |
+| `/template apply <name>` | Preview applying a template to this server |
 
-Use Discord's **Copy Server ID** option to get a server ID. The bot must be a
-member of source and target servers. Its own Discord permissions and role
-position still limit which structures it can read or create.
+### Back up and restore to another server
+
+1. In the **source server**, run `/backup`. EVIE replies with a backup ID.
+2. In the **target server**, run `/restore`, set `source_server_id` to the
+   source server's ID, and optionally set `backup_id`. Leave `backup_id` empty
+   to use the newest backup from that source.
+3. Check EVIE's preview. If it looks right, run `/confirm` with the code shown
+   in the preview within 60 seconds.
+
+You can get a server ID by enabling Discord Developer Mode, then right-clicking
+the server and choosing **Copy Server ID**. The bot must be in both servers.
+Its permissions and role position still limit which structures it can read or
+create.
 
 Backups are local files in `data/backups/`; templates are in
 `data/templates/`. On Render, the included `render.yaml` configures a paid
